@@ -1,0 +1,35 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Spark checkpoints and streaming state
+checkpoints/
+
+# Logs
+*.log
+logs/
+
+# IDE and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+
+# Dataset files (keep locally; do not commit to Git)
+data/raw/
+data/processed/
+
+# Local Spark and test artifacts
+metastore_db/
+spark-warehouse/
