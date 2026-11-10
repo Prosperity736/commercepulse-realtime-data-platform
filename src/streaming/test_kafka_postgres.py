@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -33,8 +34,7 @@ DB_CONFIG = {
 REQUIRED_SETTINGS = ("host", "dbname", "user", "password")
 
 missing_settings = [
-    setting
-    for setting in REQUIRED_SETTINGS
+    setting for setting in REQUIRED_SETTINGS
     if not DB_CONFIG.get(setting)
 ]
 
@@ -49,40 +49,62 @@ READY_FILE = (
     / "e2e_test_ready.txt"
 )
 
+READY_TIMEOUT_SECONDS = 120
+RECORD_TIMEOUT_SECONDS = 300
+POLL_INTERVAL_SECONDS = 2
+
+# Bound individual database operations so a single poll cannot
+# block verification indefinitely.
+DB_CONNECT_TIMEOUT_SECONDS = 5
+DB_STATEMENT_TIMEOUT_MS = 3000
+
 TEST_RUN_ID = uuid.uuid4().hex[:12]
 TEST_ORDER_ID = f"commercepulse_e2e_{TEST_RUN_ID}"
 TEST_CUSTOMER_ID = "commercepulse_test_customer"
 
-# Use a naive UTC timestamp for consistency with the Spark
-# session timezone configured in stream_to_postgres.py.
 BASE_EVENT_TIME = (
     datetime.now(timezone.utc)
     .replace(tzinfo=None, microsecond=0)
 )
 
-print("=" * 60)
+print("=" * 65)
 print("COMMERCEPULSE KAFKA-TO-POSTGRESQL INTEGRATION TEST")
-print("=" * 60)
+print("=" * 65)
 print(f"Test order ID: {TEST_ORDER_ID}")
 print(f"Base event time: {BASE_EVENT_TIME.isoformat()}")
+print(f"Kafka broker: {KAFKA_SERVER}")
+print(f"Orders topic: {ORDERS_TOPIC}")
+print(f"Payments topic: {PAYMENTS_TOPIC}")
+print(f"PostgreSQL database: {DB_CONFIG['dbname']}")
 
 
 # ============================================================
-# 2. VERIFY POSTGRESQL CONNECTION
+# 2. DATABASE HELPERS
 # ============================================================
 
-with psycopg.connect(**DB_CONFIG) as conn:
+def connect_to_database():
+    """Open a bounded PostgreSQL connection for test queries."""
+    return psycopg.connect(
+        **DB_CONFIG,
+        connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+        options=f"-c statement_timeout={DB_STATEMENT_TIMEOUT_MS}",
+    )
+
+
+# ============================================================
+# 3. VERIFY POSTGRESQL CONNECTION
+# ============================================================
+
+with connect_to_database() as conn:
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT COUNT(*) FROM order_payment_events"
-        )
+        cur.execute("SELECT COUNT(*) FROM order_payment_events")
         baseline_count = cur.fetchone()[0]
 
 print(f"Baseline PostgreSQL records: {baseline_count}")
 
 
 # ============================================================
-# 3. EVENT BUILDERS
+# 4. EVENT BUILDERS
 # ============================================================
 
 def build_order_event(order_id, event_time):
@@ -125,36 +147,34 @@ def publish_event(producer, topic, event):
 
 
 # ============================================================
-# 4. WAIT FOR SPARK READINESS
+# 5. WAIT FOR SPARK READINESS
 # ============================================================
 
 print("\nWaiting for the Spark streaming query...")
 
-deadline = time.time() + 120
+readiness_deadline = time.monotonic() + READY_TIMEOUT_SECONDS
 
-while time.time() < deadline:
+while time.monotonic() < readiness_deadline:
     if READY_FILE.is_file():
+        print("Spark readiness signal received.")
         break
 
     time.sleep(1)
 else:
     raise TimeoutError(
-        "Spark readiness signal was not received within "
-        "120 seconds. Check the stream_to_postgres.py terminal."
+        f"Spark readiness signal was not received within "
+        f"{READY_TIMEOUT_SECONDS} seconds. "
+        "Check the existing stream_to_postgres.py terminal."
     )
-
-print("Spark readiness signal received.")
 
 
 # ============================================================
-# 5. PUBLISH THE MATCHING ORDER AND PAYMENT
+# 6. PUBLISH THE MATCHING EVENTS
 # ============================================================
 
 producer = KafkaProducer(
     bootstrap_servers=KAFKA_SERVER,
-    value_serializer=lambda value: json.dumps(
-        value
-    ).encode("utf-8"),
+    value_serializer=lambda value: json.dumps(value).encode("utf-8"),
     acks="all",
     retries=5,
 )
@@ -175,18 +195,12 @@ try:
     )
 
     producer.flush()
-
     print("Matching events acknowledged by Kafka.")
 
-    # Publish distinct marker events at later event times.
-    # These are not expected to create PostgreSQL join records.
-    # Their purpose is to advance the input event-time watermarks.
     print("\nPublishing watermark-advancement markers...")
 
     for marker_number, minutes_ahead in enumerate((20, 40), start=1):
-        marker_time = BASE_EVENT_TIME + timedelta(
-            minutes=minutes_ahead
-        )
+        marker_time = BASE_EVENT_TIME + timedelta(minutes=minutes_ahead)
 
         marker_order_id = (
             f"commercepulse_marker_{TEST_RUN_ID}_{marker_number}"
@@ -215,84 +229,170 @@ finally:
 
 
 # ============================================================
-# 6. WAIT FOR THE EXPECTED RECORD IN POSTGRESQL
+# 7. VERIFY THE DATABASE INSERT
 # ============================================================
 
 print("\nWaiting for the joined test record in PostgreSQL...")
+print(f"Verification timeout: {RECORD_TIMEOUT_SECONDS} seconds")
+print(f"Polling interval: {POLL_INTERVAL_SECONDS} seconds")
+print(
+    "Per-query limits: "
+    f"{DB_CONNECT_TIMEOUT_SECONDS}s connection, "
+    f"{DB_STATEMENT_TIMEOUT_MS}ms statement"
+)
 
-deadline = time.time() + 180
+verification_started = time.monotonic()
+verification_deadline = verification_started + RECORD_TIMEOUT_SECONDS
+
 found_record = None
+poll_attempts = 0
+last_database_error = None
 
-while time.time() < deadline:
-    with psycopg.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT
-                    order_id,
-                    customer_id,
-                    order_status,
-                    payment_sequential,
-                    payment_type,
-                    payment_installments,
-                    payment_value,
-                    order_event_time,
-                    payment_event_time
-                FROM order_payment_events
-                WHERE order_id = %s
-                  AND payment_sequential = %s
-                """,
-                (TEST_ORDER_ID, 1),
-            )
+SELECT_TEST_RECORD_SQL = """
+    SELECT
+        order_id,
+        customer_id,
+        order_status,
+        payment_sequential,
+        payment_type,
+        payment_installments,
+        payment_value,
+        order_event_time,
+        payment_event_time
+    FROM order_payment_events
+    WHERE order_id = %s
+      AND payment_sequential = %s
+"""
 
-            found_record = cur.fetchone()
 
-    if found_record is not None:
+while True:
+    remaining_seconds = verification_deadline - time.monotonic()
+    if remaining_seconds <= 0:
         break
 
-    time.sleep(2)
+    poll_attempts += 1
+
+    try:
+        # Each connection/query is bounded, preventing a single poll
+        # from waiting indefinitely. Keep the query itself read-only.
+        with connect_to_database() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    SELECT_TEST_RECORD_SQL,
+                    (TEST_ORDER_ID, 1),
+                )
+                found_record = cur.fetchone()
+
+        last_database_error = None
+
+    except psycopg.Error as exc:
+        last_database_error = str(exc)
+        elapsed = time.monotonic() - verification_started
+        print(
+            f"[{elapsed:.1f}s] Database polling error on attempt "
+            f"{poll_attempts}: {exc}",
+            flush=True,
+        )
+
+    elapsed = time.monotonic() - verification_started
+
+    if found_record is not None:
+        print(
+            f"Record found after {elapsed:.1f} seconds "
+            f"and {poll_attempts} polling attempts.",
+            flush=True,
+        )
+        break
+
+    if poll_attempts == 1 or poll_attempts % 10 == 0:
+        print(
+            f"[{elapsed:.1f}s] Attempt {poll_attempts}: "
+            "test record not found yet.",
+            flush=True,
+        )
+
+    # Do not intentionally sleep beyond the verification deadline.
+    remaining_seconds = verification_deadline - time.monotonic()
+    if remaining_seconds > 0:
+        time.sleep(min(POLL_INTERVAL_SECONDS, remaining_seconds))
 
 
 # ============================================================
-# 7. REPORT THE RESULT
+# 8. REPORT THE RESULT
 # ============================================================
+
+elapsed_total = time.monotonic() - verification_started
+
+print("\n" + "=" * 65)
 
 if found_record is None:
-    print("\n" + "=" * 60)
-    print("TEST RESULT: NOT CONFIRMED")
-    print("=" * 60)
+    print("TEST RESULT: NOT VERIFIED WITHIN DEADLINE")
+    print("=" * 65)
     print(
-        "The expected record was not found within 180 seconds."
+        "The expected joined record was not observed before the "
+        "verification deadline. This does not prove that it can "
+        "never be inserted."
     )
-    print("Inspect the Spark terminal before retrying.")
     print(f"Test order ID: {TEST_ORDER_ID}")
+    print(f"Elapsed verification time: {elapsed_total:.1f} seconds")
+    print(f"Polling attempts: {poll_attempts}")
+    print(f"Baseline PostgreSQL records: {baseline_count}")
 
-else:
-    print("\n" + "=" * 60)
-    print("PASS: TEST RECORD FOUND IN POSTGRESQL")
-    print("=" * 60)
+    try:
+        with connect_to_database() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM order_payment_events")
+                final_count = cur.fetchone()[0]
 
-    print(f"Order ID: {found_record[0]}")
-    print(f"Customer ID: {found_record[1]}")
-    print(f"Order status: {found_record[2]}")
-    print(f"Payment sequence: {found_record[3]}")
-    print(f"Payment type: {found_record[4]}")
-    print(f"Installments: {found_record[5]}")
-    print(f"Payment value: {found_record[6]}")
-    print(f"Order event time: {found_record[7]}")
-    print(f"Payment event time: {found_record[8]}")
+                cur.execute(
+                    SELECT_TEST_RECORD_SQL,
+                    (TEST_ORDER_ID, 1),
+                )
+                final_check = cur.fetchone()
 
-    with psycopg.connect(**DB_CONFIG) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT COUNT(*) FROM order_payment_events"
+        print(f"Current PostgreSQL records: {final_count}")
+        print(f"Final direct query result: {final_check}")
+
+        if final_check is not None:
+            print(
+                "DIAGNOSTIC: The final query found the record after "
+                "the polling loop ended. Verification timing or a "
+                "transient database/query issue may be involved."
             )
-            final_count = cur.fetchone()[0]
 
-    print(f"\nBaseline records: {baseline_count}")
-    print(f"Current records: {final_count}")
+    except psycopg.Error as exc:
+        print(f"Final database diagnostic failed: {exc}")
+
+    if last_database_error:
+        print(f"Last database polling error: {last_database_error}")
 
     print(
-        "\nThe test record has been retained for inspection."
+        "\nInspect the existing Spark terminal before attempting "
+        "another test run."
     )
-    print(f"Test order ID: {TEST_ORDER_ID}")
+    sys.exit(1)
+
+
+print("TEST RESULT: PASS")
+print("=" * 65)
+print(f"Order ID: {found_record[0]}")
+print(f"Customer ID: {found_record[1]}")
+print(f"Order status: {found_record[2]}")
+print(f"Payment sequence: {found_record[3]}")
+print(f"Payment type: {found_record[4]}")
+print(f"Installments: {found_record[5]}")
+print(f"Payment value: {found_record[6]}")
+print(f"Order event time: {found_record[7]}")
+print(f"Payment event time: {found_record[8]}")
+print(f"Verification time: {elapsed_total:.1f} seconds")
+print(f"Polling attempts: {poll_attempts}")
+
+with connect_to_database() as conn:
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM order_payment_events")
+        final_count = cur.fetchone()[0]
+
+print(f"\nBaseline PostgreSQL records: {baseline_count}")
+print(f"Current PostgreSQL records: {final_count}")
+print("\nThe test record has been retained for inspection.")
+print(f"Test order ID: {TEST_ORDER_ID}")

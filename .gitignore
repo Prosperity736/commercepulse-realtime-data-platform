@@ -33,3 +33,22 @@ data/processed/
 # Local Spark and test artifacts
 metastore_db/
 spark-warehouse/
+
+# Local backups and temporary debugging artifacts
+backups/
+*.bak
+spark_thread_dump*.txt
+ledger_test_id.txt
+
+# Local audit archive
+commercepulse_audit.zip
+
+airflow/
+# Python test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environment files in subdirectories
+**/.env
+**/.env.*
